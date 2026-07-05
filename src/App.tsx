@@ -1,0 +1,680 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useState, useEffect } from 'react';
+import { Student, Teacher, SavedPin, UserSession, SchoolSettings } from './types';
+import { INITIAL_STUDENTS, INITIAL_TEACHERS } from './initialData';
+import { getSavedState, saveState, formatCurrency } from './utils';
+
+import StudentList from './components/StudentList';
+import TeacherList from './components/TeacherList';
+import DashboardStats from './components/DashboardStats';
+import StudentModal from './components/StudentModal';
+import TeacherModal from './components/TeacherModal';
+import PinLogin from './components/PinLogin';
+import SecuritySettings from './components/SecuritySettings';
+import ReceiptModal from './components/ReceiptModal';
+import SchoolSettingsPanel from './components/SchoolSettingsPanel';
+
+import { motion } from 'motion/react';
+import { 
+  Users, 
+  GraduationCap, 
+  Briefcase, 
+  BarChart3, 
+  Calendar, 
+  Wallet,
+  Settings,
+  HelpCircle,
+  TrendingUp,
+  School,
+  LogOut,
+  Fingerprint,
+  Award,
+  BookOpen,
+  Star,
+  Compass,
+  Library
+} from 'lucide-react';
+
+import {
+  initFirebaseService,
+  subscribeToStudents,
+  subscribeToTeachers,
+  subscribeToPins,
+  subscribeToSchoolSettings,
+  dbSaveStudent,
+  dbDeleteStudent,
+  dbSaveTeacher,
+  dbDeleteTeacher,
+  dbSavePin,
+  dbDeletePin,
+  dbSaveSchoolSettings,
+  uploadLocalDataToFirebase
+} from './services/firebase';
+
+const DEFAULT_SCHOOL_SETTINGS: SchoolSettings = {
+  id: 'school',
+  schoolName: 'مدرسة النجاح الخاصة للتعليم والدعم',
+  logoType: 'icon',
+  logoValue: 'School',
+  phone: '0555-44-33-22',
+  address: 'ولاية الجزائر، الجزائر',
+  notes: 'ملاحظة: الرسوم المدفوعة غير قابلة للاسترجاع بعد انطلاق الحصص. يرجى مرافقة التلميذ بانتظام.',
+  academicYear: '2025/2026'
+};
+
+export default function App() {
+  // Active user session
+  const [userSession, setUserSession] = useState<UserSession | null>(() => 
+    getSavedState<UserSession | null>('nj_school_session', null)
+  );
+
+  // States loaded dynamically based on active session's schoolId
+  const [students, setStudents] = useState<Student[]>([]);
+  const [teachers, setTeachers] = useState<Teacher[]>([]);
+  const [pins, setPins] = useState<SavedPin[]>([]);
+  const [schoolSettings, setSchoolSettings] = useState<SchoolSettings>(DEFAULT_SCHOOL_SETTINGS);
+
+  // Firebase status
+  const [isFirebaseActive, setIsFirebaseActive] = useState(false);
+
+  // Dynamically load partition-specific data on school session change
+  useEffect(() => {
+    if (userSession?.schoolId) {
+      const { schoolId } = userSession;
+      setStudents(getSavedState<Student[]>(`nj_school_students_${schoolId}`, schoolId === 'najah' ? INITIAL_STUDENTS : []));
+      setTeachers(getSavedState<Teacher[]>(`nj_school_teachers_${schoolId}`, schoolId === 'najah' ? INITIAL_TEACHERS : []));
+      setPins(getSavedState<SavedPin[]>(`nj_school_pins_${schoolId}`, []));
+      setSchoolSettings(getSavedState<SchoolSettings>(`nj_school_settings_${schoolId}`, DEFAULT_SCHOOL_SETTINGS));
+    } else {
+      setStudents([]);
+      setTeachers([]);
+      setPins([]);
+      setSchoolSettings(DEFAULT_SCHOOL_SETTINGS);
+    }
+  }, [userSession?.schoolId]);
+
+  // Synchronize with LocalStorage on updates (fallback or offline storage per school)
+  useEffect(() => {
+    if (userSession?.schoolId) {
+      saveState(`nj_school_students_${userSession.schoolId}`, students);
+    }
+  }, [students, userSession?.schoolId]);
+
+  useEffect(() => {
+    if (userSession?.schoolId) {
+      saveState(`nj_school_teachers_${userSession.schoolId}`, teachers);
+    }
+  }, [teachers, userSession?.schoolId]);
+
+  useEffect(() => {
+    if (userSession?.schoolId) {
+      saveState(`nj_school_pins_${userSession.schoolId}`, pins);
+    }
+  }, [pins, userSession?.schoolId]);
+
+  useEffect(() => {
+    if (userSession?.schoolId) {
+      saveState(`nj_school_settings_${userSession.schoolId}`, schoolSettings);
+    }
+  }, [schoolSettings, userSession?.schoolId]);
+
+  useEffect(() => {
+    saveState('nj_school_session', userSession);
+  }, [userSession]);
+
+  // Initialize Firebase connection status
+  useEffect(() => {
+    initFirebaseService((active) => {
+      setIsFirebaseActive(active);
+    });
+  }, []);
+
+  // Listen for Cloud updates in real-time if Firebase is active for the current schoolId
+  useEffect(() => {
+    if (!isFirebaseActive || !userSession?.schoolId) return;
+
+    const { schoolId } = userSession;
+
+    const unsubStudents = subscribeToStudents(schoolId, (list) => {
+      setStudents(list);
+    });
+
+    const unsubTeachers = subscribeToTeachers(schoolId, (list) => {
+      setTeachers(list);
+    });
+
+    const unsubPins = subscribeToPins(schoolId, (list) => {
+      setPins(list);
+    });
+
+    const unsubSettings = subscribeToSchoolSettings(schoolId, (settings) => {
+      if (settings && settings.schoolName) {
+        setSchoolSettings(settings);
+      }
+    });
+
+    return () => {
+      if (unsubStudents) unsubStudents();
+      if (unsubTeachers) unsubTeachers();
+      if (unsubPins) unsubPins();
+      if (unsubSettings) unsubSettings();
+    };
+  }, [isFirebaseActive, userSession?.schoolId]);
+
+  // Sync / Migrate Local Data to Firebase once on activation
+  useEffect(() => {
+    if (isFirebaseActive && userSession?.schoolId) {
+      const { schoolId } = userSession;
+      const migrationKey = `nj_school_migrated_${schoolId}`;
+      const isSchoolMigrated = getSavedState<boolean>(migrationKey, false);
+
+      if (!isSchoolMigrated && (students.length > 0 || teachers.length > 0 || pins.length > 0)) {
+        const runMigration = async () => {
+          try {
+            await uploadLocalDataToFirebase(schoolId, students, teachers, pins);
+            saveState(migrationKey, true);
+            console.log(`Firebase migration completed for school workspace: ${schoolId}`);
+          } catch (error) {
+            console.error('Error during automatic data migration:', error);
+          }
+        };
+        runMigration();
+      }
+    }
+  }, [isFirebaseActive, userSession?.schoolId, students.length, teachers.length, pins.length]);
+
+  // Log in session handler
+  const handleLoginSuccess = (pin: SavedPin, schoolId: string, customSettings?: SchoolSettings) => {
+    const session: UserSession = {
+      pinId: pin.id,
+      label: pin.label,
+      role: pin.role,
+      schoolId: schoolId,
+      loginTime: new Date().toISOString()
+    };
+    setUserSession(session);
+    if (customSettings) {
+      setSchoolSettings(customSettings);
+    }
+    displayAlert(`مرحباً بك في ${customSettings?.schoolName || 'مساحة العمل'}! تم تسجيل الدخول الآمن بنجاح.`);
+  };
+
+  const handleLogout = () => {
+    if (window.confirm('🔒 هل تريد قفل لوحة التحكم وتسجيل الخروج؟')) {
+      setUserSession(null);
+      setActiveTab('students');
+    }
+  };
+
+  // Current active navigation tab: 'students' | 'teachers' | 'stats' | 'security' | 'settings'
+  const [activeTab, setActiveTab] = useState<'students' | 'teachers' | 'stats' | 'security' | 'settings'>('students');
+
+  const handleSaveSchoolSettings = async (settings: SchoolSettings) => {
+    if (!userSession) return;
+    const { schoolId } = userSession;
+    setSchoolSettings(settings);
+    if (isFirebaseActive) {
+      await dbSaveSchoolSettings(schoolId, settings);
+    }
+  };
+
+  // Modals state
+  const [isStudentModalOpen, setIsStudentModalOpen] = useState(false);
+  const [editingStudent, setEditingStudent] = useState<Student | null>(null);
+
+  const [isTeacherModalOpen, setIsTeacherModalOpen] = useState(false);
+  const [editingTeacher, setEditingTeacher] = useState<Teacher | null>(null);
+
+  // Printable receipt state
+  const [isReceiptModalOpen, setIsReceiptModalOpen] = useState(false);
+  const [activeReceiptStudent, setActiveReceiptStudent] = useState<Student | null>(null);
+  const [activeReceiptTeacher, setActiveReceiptTeacher] = useState<Teacher | null>(null);
+
+  // Toast / Status Alerts
+  const [alertMessage, setAlertMessage] = useState<string | null>(null);
+
+  const displayAlert = (msg: string) => {
+    setAlertMessage(msg);
+    setTimeout(() => {
+      setAlertMessage(null);
+    }, 4500);
+  };
+
+  // Student CRUD operations
+  const handleSaveStudent = async (student: Student) => {
+    if (!userSession) return;
+    const { schoolId } = userSession;
+    if (isFirebaseActive) {
+      await dbSaveStudent(schoolId, student);
+      displayAlert(`[سحابي] تم حفظ بيانات المتمدرس (${student.name}) بنجاح!`);
+    } else {
+      // Local Database Fallback
+      if (editingStudent) {
+        setStudents(prev => prev.map(s => s.id === student.id ? student : s));
+        displayAlert(`تم تحديث بيانات التلميذ (${student.name}) والدفوعات بنجاح!`);
+      } else {
+        if (students.some(s => s.id === student.id)) {
+          alert('رقم التسجيل هذا مستخدم بالفعل من قبل طالب آخر!');
+          return;
+        }
+        setStudents(prev => [...prev, student]);
+        displayAlert(`تم تسجيل التلميذ (${student.name}) وتوثيق الدفع بنجاح!`);
+      }
+    }
+    setIsStudentModalOpen(false);
+    setEditingStudent(null);
+  };
+
+  const handleEditStudent = (student: Student) => {
+    setEditingStudent(student);
+    setIsStudentModalOpen(true);
+  };
+
+  const handleDeleteStudent = async (id: string) => {
+    if (!userSession) return;
+    const { schoolId } = userSession;
+    const student = students.find(s => s.id === id);
+    if (!student) return;
+    
+    if (window.confirm(`⚠️ تنبيه إداري حاسم: هل أنت متأكد من رغبتك في حذف ملف الطالب (${student.name}) نهائياً؟`)) {
+      if (isFirebaseActive) {
+        await dbDeleteStudent(schoolId, id);
+        displayAlert(`[سحابي] تم إزالة التلميذ (${student.name}) بنجاح.`);
+      } else {
+        setStudents(prev => prev.filter(s => s.id !== id));
+        displayAlert(`تم حذف ملف الطالب (${student.name}) بنجاح من السجلات المحلية.`);
+      }
+    }
+  };
+
+  // Teacher CRUD operations
+  const handleSaveTeacher = async (teacher: Teacher) => {
+    if (!userSession) return;
+    const { schoolId } = userSession;
+    if (isFirebaseActive) {
+      await dbSaveTeacher(schoolId, teacher);
+      displayAlert(`[سحابي] تم حفظ بيانات الأستاذ (${teacher.name}) بنجاح!`);
+    } else {
+      // Local Database Fallback
+      if (editingTeacher) {
+        setTeachers(prev => prev.map(t => t.id === teacher.id ? teacher : t));
+        displayAlert(`تم تحديث بيانات الأستاذ (${teacher.name}) والتعويضات الدورية بنجاح!`);
+      } else {
+        if (teachers.some(t => t.id === teacher.id)) {
+          alert('معرف الأستاذ هذا مستخدم مسبقاً! يرجى اختيار رمز تعريف آخر.');
+          return;
+        }
+        setTeachers(prev => [...prev, teacher]);
+        displayAlert(`تم تسجيل الأستاذ (${teacher.name}) وتوطين شروط مستحقاته المادية بنجاح!`);
+      }
+    }
+    setIsTeacherModalOpen(false);
+    setEditingTeacher(null);
+  };
+
+  const handleEditTeacher = (teacher: Teacher) => {
+    setEditingTeacher(teacher);
+    setIsTeacherModalOpen(true);
+  };
+
+  const handleDeleteTeacher = async (id: string) => {
+    if (!userSession) return;
+    const { schoolId } = userSession;
+    const teacher = teachers.find(t => t.id === id);
+    if (!teacher) return;
+
+    if (window.confirm(`⚠️ تحذير: هل أنت متأكد من شطب ملف الأستاذ (${teacher.name}) وإلغاء حصصه ومستحقاته المالية؟`)) {
+      if (isFirebaseActive) {
+        await dbDeleteTeacher(schoolId, id);
+        displayAlert(`[سحابي] تم حذف ملف الأستاذ (${teacher.name}) من السحابة.`);
+      } else {
+        setTeachers(prev => prev.filter(t => t.id !== id));
+        displayAlert(`تم إزالة الأستاذ (${teacher.name}) من كشوف الطاقم بنجاح.`);
+      }
+    }
+  };
+
+  // PIN code management
+  const handleAddPin = async (newPin: SavedPin) => {
+    if (!userSession) return;
+    const { schoolId } = userSession;
+    if (isFirebaseActive) {
+      await dbSavePin(schoolId, newPin);
+    } else {
+      setPins(prev => [...prev, newPin]);
+    }
+  };
+
+  const handleDeletePin = async (id: string) => {
+    if (!userSession) return;
+    const { schoolId } = userSession;
+    if (isFirebaseActive) {
+      await dbDeletePin(schoolId, id);
+    } else {
+      setPins(prev => prev.filter(p => p.id !== id));
+    }
+  };
+
+  // Header quick statistics counters
+  const studentRevenues = students.filter(s => s.status === 'active').reduce((sum, s) => sum + s.amount, 0);
+  const formattedRevenues = formatCurrency(studentRevenues);
+
+  // If there is no active logged-in user session, enforce PinLogin first!
+  if (!userSession) {
+    return (
+      <PinLogin 
+        isFirebaseActive={isFirebaseActive}
+        onLoginSuccess={handleLoginSuccess}
+        fallbackAdminPin="2026"
+      />
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 text-gray-900 pb-16">
+      
+      {/* 1. Header Banner & Logo */}
+      <header className="bg-white border-b border-gray-200/80 sticky top-0 z-30 shadow-xs">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 flex flex-col sm:flex-row justify-between items-center gap-4">
+          
+          {/* Logo Brand Frame */}
+          <div className="flex items-center gap-3">
+            <div className="p-1 rounded-xl bg-blue-50 border border-blue-100 flex items-center justify-center">
+              {schoolSettings.logoType === 'icon' ? (
+                (() => {
+                  const PRESET_ICONS = { School, GraduationCap, Award, BookOpen, Star, Compass, Library };
+                  const IconComponent = PRESET_ICONS[schoolSettings.logoValue as keyof typeof PRESET_ICONS] || School;
+                  return <IconComponent className="w-7 h-7 text-blue-700" />;
+                })()
+              ) : schoolSettings.logoType === 'text' ? (
+                <span className="text-2xl p-1 font-sans">{schoolSettings.logoValue || '🏫'}</span>
+              ) : schoolSettings.logoType === 'image' && schoolSettings.logoValue ? (
+                <img 
+                  src={schoolSettings.logoValue}
+                  alt="شعار المدرسة"
+                  className="h-10 w-auto rounded-lg object-contain max-w-28"
+                  referrerPolicy="no-referrer"
+                />
+              ) : (
+                <img 
+                  src="https://scontent.faae1-1.fna.fbcdn.net/v/t1.15752-9/535575380_766411842414847_6734401257965136101_n.jpg?stp=dst-jpg_s480x480_tt6&_nc_cat=107&ccb=1-7&_nc_sid=0024fc&_nc_eui2=AeEOU6Ah_ShYNqWyg70a-m-XTWJeV1xOtJBNYl5XXE60kK9pzidq2nYoHNe59CTeMaC5ADUjKi1YMn1naQc-jyrG&_nc_ohc=gO4f5WugaHgQ7kNvwFiph8X&_nc_oc=AdqedIlBrImqdluOuzVWFBwqZjslramrgpQgMGi9ckmauOvKGnb77CYSquMpiWDg6Pg&_nc_ad=z-m&_nc_cid=1060&_nc_zt=23&_nc_ht=scontent.faae1-1.fna&_nc_ss=7a22e&oh=03_Q7cD5gEsD3mzaaLaVZ7Q8adtjvWhFo_jJqvdXOexiwnPJMy3hA&oe=6A456A68"
+                  alt="شعار مدرسة النجاح"
+                  className="h-10 w-auto rounded-lg object-contain"
+                  referrerPolicy="no-referrer"
+                  onError={(e) => {
+                    (e.target as HTMLElement).style.display = 'none';
+                  }}
+                />
+              )}
+            </div>
+            <div className="space-y-0.5 justify-start text-right">
+              <div className="flex items-center gap-1.5 justify-start">
+                <School className="w-5 h-5 text-blue-700" />
+                <h1 className="text-md sm:text-lg font-extrabold text-blue-900 tracking-tight">{schoolSettings.schoolName}</h1>
+              </div>
+              <p className="text-[10px] sm:text-xs text-gray-500 font-medium">
+                لوحة التحكم والتنظيم المالي والإداري • إدارة المتعهدين والطلاب والأساتذة
+              </p>
+            </div>
+          </div>
+
+          {/* Quick Realtime header counters */}
+          <div className="flex flex-wrap items-center gap-2.5 sm:gap-4">
+            <div className="bg-emerald-50 text-emerald-900 px-3.5 py-1.5 rounded-xl border border-emerald-100 flex items-center gap-2 text-xs font-bold">
+              <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
+              <span>مداخيل المدرسة النشطة: {formattedRevenues}</span>
+            </div>
+            
+            <div className="bg-gray-100 text-gray-700 px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 font-sans">
+              <Calendar className="w-4 h-4 text-gray-500" />
+              <span>الموسم الدراسي: {schoolSettings.academicYear || '2025/2026'}</span>
+            </div>
+
+            {/* Logout Lock control */}
+            <button
+              onClick={handleLogout}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-red-50 hover:bg-red-100 text-red-700 hover:text-red-900 rounded-xl text-[11px] font-bold border border-red-100/50 transition-colors cursor-pointer"
+              title="قفل لوحة التحكم وتسجيل الخروج"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              <span>قفل الخروج</span>
+            </button>
+          </div>
+
+        </div>
+      </header>
+
+      {/* 2. Main Container with Tab Buttons navigation */}
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 mt-8 space-y-6">
+        
+        {/* Active user status bar */}
+        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center bg-blue-50/45 px-5 py-2.5 rounded-2xl border border-blue-100/40 text-[11px] font-bold text-blue-950 gap-2">
+          <div className="flex items-center gap-2">
+            <span className="text-sm">👤</span>
+            <span>المستخدم الحالي: <span className="underline">{userSession.label}</span> ({userSession.role === 'admin' ? 'مدير عام كامل الصلاحيات' : 'موظف مأذون له'})</span>
+          </div>
+          {isFirebaseActive ? (
+            <div className="text-emerald-700 flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+              <span>موصول بالشبكة السحابية المشتركة (الهاتف والكمبيوتر متطابقان فورياً)</span>
+            </div>
+          ) : (
+            <div className="text-gray-500 flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full bg-gray-400"></span>
+              <span>قاعدة بيانات محلية نشطة (سيتم المزامنة تلقائياً عند الاتصال)</span>
+            </div>
+          )}
+        </div>
+
+        {/* Alerts / Banner Notifications */}
+        {alertMessage && (
+          <motion.div 
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            className="p-4 bg-blue-950 text-white rounded-2xl border border-blue-900 shadow-lg text-xs font-bold flex items-center gap-2"
+          >
+            <span className="text-base">🔔</span>
+            <span>{alertMessage}</span>
+          </motion.div>
+        )}
+
+        {/* Tab Buttons Shelf */}
+        <div className="bg-white p-2.5 rounded-2xl border border-gray-200 shadow-xs flex flex-wrap gap-2">
+          <button
+            onClick={() => setActiveTab('students')}
+            className={`flex items-center gap-2 px-5 py-3 text-xs font-bold rounded-xl transition-all cursor-pointer ${
+              activeTab === 'students' 
+                ? 'bg-blue-600 text-white shadow-xs' 
+                : 'text-gray-600 hover:bg-gray-100'
+            }`}
+            id="tab-students"
+          >
+            <Users className="w-4 h-4" />
+            قائمة التلاميذ والمسجلين ({students.length})
+          </button>
+
+          <button
+            onClick={() => setActiveTab('teachers')}
+            className={`flex items-center gap-2 px-5 py-3 text-xs font-bold rounded-xl transition-all cursor-pointer ${
+              activeTab === 'teachers' 
+                ? 'bg-blue-600 text-white shadow-xs' 
+                : 'text-gray-600 hover:bg-gray-100'
+            }`}
+            id="tab-teachers"
+          >
+            <GraduationCap className="w-4 h-4" />
+            قائمة الأساتذة والمستحقات ({teachers.length})
+          </button>
+
+          <button
+            onClick={() => setActiveTab('stats')}
+            className={`flex items-center gap-2 px-5 py-3 text-xs font-bold rounded-xl transition-all cursor-pointer ${
+              activeTab === 'stats' 
+                ? 'bg-blue-600 text-white shadow-xs' 
+                : 'text-gray-600 hover:bg-gray-100'
+            }`}
+            id="tab-stats"
+          >
+            <BarChart3 className="w-4 h-4" />
+            الإحصائيات المالية والتقارير الشهرية
+          </button>
+
+          {/* Secure Admin configuration */}
+          {userSession.role === 'admin' && (
+            <button
+              onClick={() => setActiveTab('security')}
+              className={`flex items-center gap-2 px-5 py-3 text-xs font-bold rounded-xl transition-all cursor-pointer ${
+                activeTab === 'security' 
+                  ? 'bg-indigo-600 text-white shadow-xs' 
+                  : 'text-indigo-600 hover:bg-indigo-50 border border-indigo-100/10'
+              }`}
+              id="tab-security"
+            >
+              <Fingerprint className="w-4 h-4" />
+              إعدادات الأمان والتراخيص ({pins.length + 1})
+            </button>
+          )}
+
+          {/* School Identity Settings */}
+          {userSession.role === 'admin' && (
+            <button
+              onClick={() => setActiveTab('settings')}
+              className={`flex items-center gap-2 px-5 py-3 text-xs font-bold rounded-xl transition-all cursor-pointer ${
+                activeTab === 'settings' 
+                  ? 'bg-emerald-600 text-white shadow-xs' 
+                  : 'text-emerald-700 hover:bg-emerald-50 border border-emerald-100/10'
+              }`}
+              id="tab-settings"
+            >
+              <School className="w-4 h-4" />
+              هوية المؤسسة والشعار
+            </button>
+          )}
+
+        </div>
+
+        {/* 3. Panel Views rendering */}
+        <div className="transition-all duration-300">
+          {activeTab === 'students' && (
+            <StudentList
+              students={students}
+              onAddClick={() => {
+                setEditingStudent(null);
+                setIsStudentModalOpen(true);
+              }}
+              onEditClick={handleEditStudent}
+              onDeleteClick={handleDeleteStudent}
+              onPrintClick={(s) => {
+                setActiveReceiptTeacher(null);
+                setActiveReceiptStudent(s);
+                setIsReceiptModalOpen(true);
+              }}
+            />
+          )}
+
+          {activeTab === 'teachers' && (
+            <TeacherList
+              teachers={teachers}
+              students={students}
+              onAddClick={() => {
+                setEditingTeacher(null);
+                setIsTeacherModalOpen(true);
+              }}
+              onEditClick={handleEditTeacher}
+              onDeleteClick={handleDeleteTeacher}
+              onPrintClick={(t) => {
+                setActiveReceiptStudent(null);
+                setActiveReceiptTeacher(t);
+                setIsReceiptModalOpen(true);
+              }}
+            />
+          )}
+
+          {activeTab === 'stats' && (
+            <DashboardStats
+              students={students}
+              teachers={teachers}
+              onUpdateStudent={handleSaveStudent}
+              onPrintStudent={(s) => {
+                setActiveReceiptTeacher(null);
+                setActiveReceiptStudent(s);
+                setIsReceiptModalOpen(true);
+              }}
+            />
+          )}
+
+          {activeTab === 'security' && userSession.role === 'admin' && (
+            <SecuritySettings
+              pins={pins}
+              onAddPin={handleAddPin}
+              onDeletePin={handleDeletePin}
+              isFirebaseSynced={isFirebaseActive}
+              currentUserPin={pins.find(p => p.id === userSession.pinId) || {
+                id: 'default_admin',
+                pin: '2026',
+                label: 'المدير العام',
+                role: 'admin',
+                createdAt: ''
+              }}
+            />
+          )}
+
+          {activeTab === 'settings' && userSession.role === 'admin' && (
+            <SchoolSettingsPanel
+              settings={schoolSettings}
+              onSaveSettings={handleSaveSchoolSettings}
+              isFirebaseSynced={isFirebaseActive}
+            />
+          )}
+        </div>
+
+      </main>
+
+      {/* 4. Modular Modals */}
+      <StudentModal
+        isOpen={isStudentModalOpen}
+        onClose={() => {
+          setIsStudentModalOpen(false);
+          setEditingStudent(null);
+        }}
+        onSave={handleSaveStudent}
+        editingStudent={editingStudent}
+      />
+
+      <TeacherModal
+        isOpen={isTeacherModalOpen}
+        onClose={() => {
+          setIsTeacherModalOpen(false);
+          setEditingTeacher(null);
+        }}
+        onSave={handleSaveTeacher}
+        editingTeacher={editingTeacher}
+      />
+
+      {/* 5. Printable Receipt Modal */}
+      <ReceiptModal
+        isOpen={isReceiptModalOpen}
+        onClose={() => {
+          setIsReceiptModalOpen(false);
+          setActiveReceiptStudent(null);
+          setActiveReceiptTeacher(null);
+        }}
+        student={activeReceiptStudent}
+        teacher={activeReceiptTeacher}
+        schoolSettings={schoolSettings}
+      />
+
+      {/* Footer Branding info */}
+      <footer className="max-w-7xl mx-auto px-4 sm:px-6 text-center text-xs text-gray-400 mt-12 space-y-1 py-4 border-t border-gray-150">
+        <p>© 2026 {schoolSettings.schoolName}. جميع الحقوق محفوظة.</p>
+        <p className="font-mono">نظام مشفر ومؤمن سحابياً لحفظ وتدقيق رواتب المعلمين والمعاملات الدراسية تلقائياً.</p>
+      </footer>
+
+    </div>
+  );
+}
